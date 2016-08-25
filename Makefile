@@ -13,7 +13,7 @@ ethiptunnel: ethiptunnel.c
 
 clean:
 	@rm -f etherip.ko etherip.mod.c etherip.mod.o etherip.o
-	@rm -f ethiptunnel Module.symvers
+	@rm -f ethiptunnel Module.symvers modules.order
 	@find -type f -name "\.*"|xargs rm -f
 	@rm -rf .tmp_versions
 
