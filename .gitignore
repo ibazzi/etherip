@@ -1,0 +1,8 @@
+*.cmd
+*.o
+*.mod.c
+.tmp_versions
+Module.symvers
+modules.order
+*.ko
+ethiptunnel
