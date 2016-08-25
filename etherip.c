@@ -13,10 +13,6 @@
  *      version 2 (no later version) as published by the
  *      Free Software Foundation.
  *
- * Fixes:
- *       Kazunori Kojima  : Support kernel version 2.6.30 - 2.6.35
- * Thanks:
- * 	Michal Rybarik    : Adding support for changing of MAC address
  */
 
 #include <linux/capability.h>                           
@@ -33,11 +29,10 @@
 #include <linux/list.h>
 #include <linux/string.h>
 #include <linux/netfilter_ipv4.h>
-#include <linux/if_arp.h>
 #include <net/ip.h>
 #include <net/protocol.h>
 #include <net/route.h>
-#include <net/ipip.h>
+#include <net/ip_tunnels.h>
 #include <net/xfrm.h>
 #include <net/inet_ecn.h>
 
@@ -49,14 +44,31 @@ MODULE_DESCRIPTION("Ethernet over IPv4 tunnel driver");
 #define IPPROTO_ETHERIP 97
 #endif
 
+#define __IPTUNNEL_XMIT_COMPAT(net, sk, stats1, stats2) do {				\
+	int err;							\
+	int pkt_len = skb->len - skb_transport_offset(skb);		\
+									\
+	skb->ip_summed = CHECKSUM_NONE;					\
+	__ip_select_ident(net, iph, skb_shinfo(skb)->gso_segs ?: 1);	\
+									\
+	err = ip_local_out(net, sk, skb);					\
+	if (likely(net_xmit_eval(err) == 0)) {				\
+		(stats1)->tx_bytes += pkt_len;				\
+		(stats1)->tx_packets++;					\
+	} else {							\
+		(stats2)->tx_errors++;					\
+		(stats2)->tx_aborted_errors++;				\
+	}								\
+} while (0)
+
 /*
  * These 2 defines are taken from ipip.c - if it's good enough for them
  * it's good enough for me.
  */
 #define HASH_SIZE        16
-#define HASH(addr) (((__force u32)addr^((__force u32)addr>>4))&0xF)
+#define HASH(addr)       ((addr^(addr>>4))&0xF)
 
-#define ETHERIP_HEADER   ((u16)0x3000)
+#define ETHERIP_HEADER   ((u16)0x0300)
 #define ETHERIP_HLEN     2
 
 #define BANNER1 "etherip: Ethernet over IPv4 tunneling driver\n"
@@ -64,11 +76,44 @@ MODULE_DESCRIPTION("Ethernet over IPv4 tunnel driver");
 struct etherip_tunnel {
 	struct list_head list;
 	struct net_device *dev;
-	struct net_device_stats stats;
 	struct ip_tunnel_parm parms;
 	unsigned int recursion;
 };
 
+
+/*struct pcpu_tstats {
+	unsigned long	rx_packets;
+	unsigned long	rx_bytes;
+	unsigned long	tx_packets;
+	unsigned long	tx_bytes;
+};*/
+
+static void etherip_dev_free(struct net_device *dev)
+{
+//	free_percpu(dev->tstats);
+	free_netdev(dev);
+}
+/*
+static struct net_device_stats *etherip_get_stats(struct net_device *dev)
+{
+	struct pcpu_tstats sum = { 0 };
+	int i;
+
+	for_each_possible_cpu(i) {
+		const struct pcpu_tstats *tstats = per_cpu_ptr(dev->tstats, i);
+
+		sum.rx_packets += tstats->rx_packets;
+		sum.rx_bytes   += tstats->rx_bytes;
+		sum.tx_packets += tstats->tx_packets;
+		sum.tx_bytes   += tstats->tx_bytes;
+	}
+	dev->stats.rx_packets = sum.rx_packets;
+	dev->stats.rx_bytes   = sum.rx_bytes;
+	dev->stats.tx_packets = sum.tx_packets;
+	dev->stats.tx_bytes   = sum.tx_bytes;
+	return &dev->stats;
+}
+*/
 static struct net_device *etherip_tunnel_dev;
 static struct list_head tunnels[HASH_SIZE];
 
@@ -135,31 +180,27 @@ static int etherip_tunnel_stop(struct net_device *dev)
 static int etherip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct etherip_tunnel *tunnel = netdev_priv(dev);
-	struct net_device_stats *stats = &dev->stats;
-	struct netdev_queue *txq = netdev_get_tx_queue(dev, 0);
-	struct iphdr *tiph = &tunnel->parms.iph;
-	struct rtable *rt;	/* Route to the other host */
-	struct flowi fl;
-	struct iphdr *iph;	/* new IP haeder */
-	struct net_device *tdev;	/* Device to other host */
-	int max_headroom;	/* The extra header space needed */
-	int err;
+//	struct pcpu_tstats *tstats;
+	struct iphdr *iph;
+	struct flowi4 fl;
+	struct net_device *tdev;
+	struct rtable *rt;
+	int max_headroom;
+	struct net_device_stats *stats = &tunnel->dev->stats;
 
 	if (tunnel->recursion++) {
 		stats->collisions++;
 		goto tx_error;
 	}
 
-	/* trying to locate device to route data to */
 	memset(&fl, 0, sizeof(fl));
-	fl.oif               = 0; //tunnel->parms.link;
-	fl.proto             = IPPROTO_ETHERIP;
-	fl.nl_u.ip4_u.daddr  = tunnel->parms.iph.daddr;
-	fl.nl_u.ip4_u.saddr  = tunnel->parms.iph.saddr;
-
-	if ((err = ip_route_output_key(dev_net(tunnel->dev), &rt, &fl))) {
+	fl.flowi4_oif               = tunnel->parms.link;
+	fl.flowi4_proto             = IPPROTO_ETHERIP;
+	fl.daddr  = tunnel->parms.iph.daddr;
+	fl.saddr  = tunnel->parms.iph.saddr;
+	rt = ip_route_output_key(dev_net(dev), &fl);
+	if (IS_ERR(rt)) {
 		stats->tx_carrier_errors++;
-		printk (KERN_INFO "etherip+: cannot find route for address 0x%x\n", tiph->daddr);
 		goto tx_error_icmp;
 	}
 
@@ -179,8 +220,8 @@ static int etherip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
 		if (!skn) {
 			ip_rt_put(rt);
 			dev_kfree_skb(skb);
-			txq->tx_dropped++;
-			return NETDEV_TX_OK;
+			dev->stats.tx_dropped++;			
+			return 0;
 		}
 		if (skb->sk)
 			skb_set_owner_w(skn, skb->sk);
@@ -188,7 +229,7 @@ static int etherip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
 		skb = skn;
 	}
 
-	skb_reset_transport_header(skb);
+	skb->transport_header = skb->mac_header;
 	skb_push(skb, sizeof(struct iphdr)+ETHERIP_HLEN);
 	skb_reset_network_header(skb);
 	memset(&(IPCB(skb)->opt), 0, sizeof(IPCB(skb)->opt));
@@ -222,20 +263,24 @@ static int etherip_tunnel_xmit(struct sk_buff *skb, struct net_device *dev)
 	iph->frag_off = 0;
 	iph->protocol = IPPROTO_ETHERIP;
 	iph->tos = tunnel->parms.iph.tos & INET_ECN_MASK;
-	iph->daddr = rt->rt_dst;
-	iph->saddr = rt->rt_src;
+	iph->daddr = fl.daddr;
+	iph->saddr = fl.saddr;
+
+//	iph->daddr = rt->rt_dst;
+//	iph->saddr = rt->rt_src;
 	iph->ttl = tunnel->parms.iph.ttl;
 	if (iph->ttl == 0)
-		iph->ttl = dst_metric(&rt->dst, RTAX_HOPLIMIT);
+		iph->ttl = ip4_dst_hoplimit(&rt->dst);
 
 	/* add the 16bit etherip header after the ip header */
 	((u16*)(iph+1))[0]=htons(ETHERIP_HEADER);
 	nf_reset(skb);
-	IPTUNNEL_XMIT();
+//	tstats = this_cpu_ptr(dev->tstats);
+	__IPTUNNEL_XMIT_COMPAT(dev_net(dev), skb->sk, &dev->stats, &dev->stats);
 	tunnel->dev->trans_start = jiffies;
 	tunnel->recursion--;
 
-	return NETDEV_TX_OK;
+	return 0;
 
 tx_error_icmp:
 	dst_link_failure(skb);
@@ -244,8 +289,9 @@ tx_error:
 	stats->tx_errors++;
 	dev_kfree_skb(skb);
 	tunnel->recursion--;
-	return NETDEV_TX_OK;
+	return 0;
 }
+
 
 /* checks parameters the driver gets from userspace */
 static int etherip_param_check(struct ip_tunnel_parm *p)
@@ -259,21 +305,6 @@ static int etherip_param_check(struct ip_tunnel_parm *p)
 
 	return 0;
 }
-
-static int etherip_tunnel_set_mac_address(struct net_device *dev, void *p) 
-{
-	struct sockaddr *addr = p;
-
-	if (netif_running(dev))
-		return -EBUSY;
-	if (!is_valid_ether_addr(addr->sa_data))
-		return -EADDRNOTAVAIL;
-
-	memcpy(dev->dev_addr, addr->sa_data, dev->addr_len);
-
-	return 0;
-}
-
 
 /* central ioctl function for all netdevices this driver manages
  * it allows to create, delete, modify a tunnel and fetch tunnel
@@ -330,7 +361,7 @@ static int etherip_tunnel_ioctl(struct net_device *dev, struct ifreq *ifr,
 			err = -ENOMEM;
 			tmp_dev = alloc_netdev(
 					sizeof(struct etherip_tunnel),
-					dev_name,
+					dev_name,NET_NAME_UNKNOWN,
 					etherip_tunnel_setup);
 
 			if (tmp_dev == NULL)
@@ -344,6 +375,10 @@ static int etherip_tunnel_ioctl(struct net_device *dev, struct ifreq *ifr,
 
 			t = netdev_priv(tmp_dev);
 			t->dev = tmp_dev;
+//			tmp_dev->tstats = alloc_percpu(struct pcpu_tstats);
+//			if (!tmp_dev->tstats)
+//			    goto add_err;
+
 			strncpy(p.name, tmp_dev->name, IFNAMSIZ);
 			memcpy(&(t->parms), &p, sizeof(p));
 
@@ -374,7 +409,7 @@ static int etherip_tunnel_ioctl(struct net_device *dev, struct ifreq *ifr,
 		err = 0;
 		break;
 add_err:
-		free_netdev(tmp_dev);
+		etherip_dev_free(tmp_dev);
 		goto out;
 
 	case SIOCDELTUNNEL:
@@ -382,13 +417,13 @@ add_err:
 		if (!capable(CAP_NET_ADMIN))
 			goto out;
 
-		if (dev == etherip_tunnel_dev) {
-			err = -EFAULT;
-			if (copy_from_user(&p, ifr->ifr_ifru.ifru_data,
-						sizeof(p)))
-				goto out;
+		err = -EFAULT;
+		if (copy_from_user(&p, ifr->ifr_ifru.ifru_data,
+					sizeof(p)))
+			goto out;
 
-			err = -EINVAL;
+		err = -EINVAL;
+		if (dev == etherip_tunnel_dev) {
 			t = etherip_tunnel_find(&p);
 			if (t == NULL) {
 				goto out;
@@ -411,12 +446,14 @@ add_err:
 out:
 	return err;
 }
-static const struct net_device_ops etherip_netdev_ops = {                                                                                       
-	.ndo_open	= etherip_tunnel_open,  
-	.ndo_stop	= etherip_tunnel_stop,
-	.ndo_start_xmit	= etherip_tunnel_xmit,
-	.ndo_do_ioctl	= etherip_tunnel_ioctl,
-	.ndo_set_mac_address	= etherip_tunnel_set_mac_address,
+
+
+static const struct net_device_ops etherip_netdev_ops = {
+	.ndo_open		= etherip_tunnel_open,
+	.ndo_stop		= etherip_tunnel_stop,
+	.ndo_start_xmit		= etherip_tunnel_xmit,
+	.ndo_do_ioctl		= etherip_tunnel_ioctl,
+//	.ndo_get_stats  	= etherip_get_stats,
 };
 
 /* device init function - called via register_netdevice
@@ -424,12 +461,13 @@ static const struct net_device_ops etherip_netdev_ops = {
  * the tunnel to be added to a bridge */
 static void etherip_tunnel_setup(struct net_device *dev)
 {
+	dev->netdev_ops		= &etherip_netdev_ops;
+	dev->destructor      = etherip_dev_free;
+	dev->features		|= NETIF_F_NETNS_LOCAL;
+	dev->priv_flags		&= ~IFF_XMIT_DST_RELEASE;
+
 	ether_setup(dev);
-	dev->netdev_ops      = &etherip_netdev_ops;
-	dev->destructor      = free_netdev;
-	dev->tx_queue_len    = 0;
-	dev->type            = ARPHRD_ETHER;
-	dev->mtu             = ETH_DATA_LEN - dev->hard_header_len - sizeof(struct iphdr) - ETHERIP_HLEN;
+	dev->tx_queue_len = 0;
 	random_ether_addr(dev->dev_addr);
 }
 
@@ -448,25 +486,22 @@ static int etherip_rcv(struct sk_buff *skb)
 	tunnel = etherip_tunnel_locate(iph->saddr);
 	if (tunnel == NULL)
 		goto drop;
+//	struct pcpu_tstats *tstats;
 
 	dev = tunnel->dev;
 	secpath_reset(skb);
-	skb->mac_header = skb->network_header;
-	skb_reset_network_header(skb);
+	skb_pull(skb, ETHERIP_HLEN);
 	skb->dev = dev;
 	skb->pkt_type = PACKET_HOST;
-	skb_pull(skb, ETHERIP_HLEN);
 	skb->protocol = eth_type_trans(skb, tunnel->dev);
 	skb->ip_summed = CHECKSUM_UNNECESSARY;
 	skb_dst_drop(skb);
-	skb_dst_set(skb, NULL);
 
 	/* do some checks */
 	if (skb->pkt_type == PACKET_HOST || skb->pkt_type == PACKET_BROADCAST)
 		goto accept;
 
-	if (skb->pkt_type == PACKET_MULTICAST &&
-			(netdev_mc_count(dev) > 0 || dev->flags & IFF_ALLMULTI))
+	if (skb->pkt_type == PACKET_MULTICAST && (netdev_mc_count(dev) > 0 || dev->flags & IFF_ALLMULTI))
 		goto accept;
 
 	if (skb->pkt_type == PACKET_OTHERHOST && dev->flags & IFF_PROMISC)
@@ -478,6 +513,10 @@ drop:
 	return 0;
 
 accept:
+//	tstats = this_cpu_ptr(tunnel->dev->tstats);
+//	tstats->rx_packets++;
+//	tstats->rx_bytes += skb->len;
+	
 	tunnel->dev->last_rx = jiffies;
 	tunnel->dev->stats.rx_packets++;
 	tunnel->dev->stats.rx_bytes += skb->len;
@@ -492,6 +531,7 @@ static struct net_protocol etherip_protocol = {
 	.handler      = etherip_rcv,
 	.err_handler  = 0,
 	.no_policy    = 0,
+	.netns_ok     = 1,
 };
 
 /* module init function
@@ -513,7 +553,7 @@ static int __init etherip_init(void)
 	}
 
 	etherip_tunnel_dev = alloc_netdev(sizeof(struct etherip_tunnel),
-			"ethip0",
+			"etherip0",NET_NAME_UNKNOWN,
 			etherip_tunnel_setup);
 
 	if (!etherip_tunnel_dev) {
@@ -524,16 +564,20 @@ static int __init etherip_init(void)
 	p = netdev_priv(etherip_tunnel_dev);
 	p->dev = etherip_tunnel_dev;
 	/* set some params for iproute2 */
-	strcpy(p->parms.name, "ethip0");
+	strcpy(p->parms.name, "etherip0");
 	p->parms.iph.protocol = IPPROTO_ETHERIP;
 
 	if ((err = register_netdev(etherip_tunnel_dev)))
 		goto err1;
 
+//	etherip_tunnel_dev->tstats = alloc_percpu(struct pcpu_tstats);
+//	if (!etherip_tunnel_dev->tstats)
+//		return -ENOMEM;
+
 out:
 	return err;
 err1:
-	free_netdev(etherip_tunnel_dev);
+	etherip_dev_free(etherip_tunnel_dev);
 err2:
 	inet_del_protocol(&etherip_protocol, IPPROTO_ETHERIP);
 	goto out;
